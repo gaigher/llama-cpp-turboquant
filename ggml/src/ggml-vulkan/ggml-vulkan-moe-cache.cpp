@@ -18,6 +18,10 @@
 //     with the UMA flags; that aperture is rejected when smaller than the
 //     cache budget (see session_create). Override with
 //     GGML_VK_MOE_CACHE_FORCE_DEVICE_LOCAL=1.
+//   - Safe default (T6): --moe-cache on/auto does NOT enable the
+//     device-local+staging path on discrete/aperture GPUs (measured ~10x
+//     slower on Polaris). Explicit MiB (--moe-cache 512) still allows it
+//     for experiments; or set GGML_VK_MOE_CACHE_ALLOW_STAGING=1.
 //   - fused SwiGLU returns NULL (stock CPU path handles the node)
 //
 // Register by calling ggml_vulkan_moe_cache_register() from
@@ -34,6 +38,8 @@
 #include "../ggml-quants.h"
 #include "../ggml-moe-cache-common.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
@@ -133,6 +139,20 @@ struct moe_cache_vulkan_device : public moe_cache_device {
     // true when a large-enough DEVICE_LOCAL|HOST_VISIBLE heap exists (real UMA).
     // Small CPU-visible apertures on discrete GPUs must not set this.
     bool host_mapped = false;
+    // Largest DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT heap (bytes). Used to
+    // re-check host_mapped once the effective budget is known at pool create
+    // (budget_mb may still be 0 / "1 GiB provisional" at session_create).
+    size_t uma_heap_bytes = 0;
+
+    // Staging-path observability (T2/T3). Cheap atomics-free counters: the
+    // dispatch lock serializes plan() on this device.
+    long long staging_copies = 0;       // batch H->D submits
+    uint64_t  staging_bytes_h2d = 0;    // payload bytes staged into DEVICE_LOCAL
+    uint64_t  staging_sync_ns = 0;      // time in vk_submit_and_wait for fills
+    // T5-lite: once staging thrash is obvious (evictions ~ fills on a full
+    // pool), stop further fills for this session - hits-only beats endless
+    // WaitIdle reloads on Polaris.
+    bool staging_thrash_stopped = false;
 
     // Command pool and pipelines are created lazily on the first begin, so a
     // context that never uses the cache allocates no GPU objects.
@@ -740,6 +760,112 @@ static int vk_moe_query_shape(int wtype, int64_t n_in, int64_t n_out,
 // Pool lifecycle
 // ---------------------------------------------------------------------------
 
+// Re-check host_mapped against the *effective* budget at pool create.
+// session_create may have used a provisional 1 GiB floor when budget_mb==0.
+static void vk_moe_revalidate_host_mapped(
+        moe_cache_vulkan_device & dev, size_t budget_bytes);
+
+// Resolve free-minus-reserve (or explicit cap) once per device, then
+// revalidate host_mapped against the *granted* budget. Mirrors CUDA
+// moe_cache_prepare_budget, simplified for the single Vulkan0 session.
+static bool vk_moe_prepare_budget(
+        moe_cache_session & session, moe_cache_vulkan_device & dev) {
+    if (dev.budget_ready) {
+        return dev.budget_limit > 0;
+    }
+    dev.budget_ready = true;
+
+    size_t free_memory = 0;
+    size_t total_memory = 0;
+    ggml_backend_vk_get_device_memory(dev.logical, &free_memory, &total_memory);
+
+    const size_t reserve_bytes = session.config.reserve_mb << 20;
+    size_t available = free_memory > reserve_bytes
+        ? free_memory - reserve_bytes
+        : 0;
+    if (session.config.budget_mb > 0) {
+        available = std::min(available, session.config.budget_mb << 20);
+    }
+
+    dev.budget_limit = available;
+    dev.budget_claimed = true;
+    dev.budget_reserve_bytes = reserve_bytes;
+
+    if (session.config.budget_mb > 0) {
+        MOE_CACHE_LOG("[moe-cache] Vulkan%d capacity: cap=%zu MiB granted=%zu MiB "
+                "free=%zu MiB total=%zu MiB reserve=%zu MiB\n",
+                dev.physical, session.config.budget_mb, available >> 20,
+                free_memory >> 20, total_memory >> 20, reserve_bytes >> 20);
+    } else {
+        MOE_CACHE_LOG("[moe-cache] Vulkan%d capacity: policy=free-minus-reserve "
+                "granted=%zu MiB free=%zu MiB total=%zu MiB reserve=%zu MiB\n",
+                dev.physical, available >> 20, free_memory >> 20,
+                total_memory >> 20, reserve_bytes >> 20);
+    }
+
+    if (available == 0) {
+        MOE_CACHE_LOG("[moe-cache] Vulkan%d: no budget after reserve; cache idle\n",
+                dev.physical);
+        return false;
+    }
+
+    vk_moe_revalidate_host_mapped(dev, available);
+
+    // T6: on discrete/aperture the only viable path is device-local + staging,
+    // which is much slower than --moe-cache off on Polaris. Refuse that path
+    // for on/auto (budget_mb==0). Explicit MiB, ALLOW_STAGING, or FORCE keep it.
+    if (!dev.host_mapped) {
+        int64_t allow_staging = 0;
+        const bool env_allow = moe_cache_env_i64(
+                "GGML_VK_MOE_CACHE_ALLOW_STAGING", 0, 1, allow_staging) &&
+            allow_staging != 0;
+        int64_t force_dl = 0;
+        const bool env_force = moe_cache_env_i64(
+                "GGML_VK_MOE_CACHE_FORCE_DEVICE_LOCAL", 0, 1, force_dl) &&
+            force_dl != 0;
+        const bool explicit_budget = session.config.budget_mb > 0;
+        if (!explicit_budget && !env_allow && !env_force) {
+            MOE_CACHE_LOG("[moe-cache] Vulkan%d: refusing device-local + staging "
+                    "for --moe-cache on/auto (slow on discrete; measured ~10x "
+                    "slower than off on Polaris). Prefer --moe-cache off. "
+                    "Experiments: pass an explicit MiB budget or set "
+                    "GGML_VK_MOE_CACHE_ALLOW_STAGING=1.\n",
+                    dev.physical);
+            dev.budget_limit = 0;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void vk_moe_revalidate_host_mapped(
+        moe_cache_vulkan_device & dev, size_t budget_bytes) {
+    int64_t force_device_local = 0;
+    if (moe_cache_env_i64(
+                "GGML_VK_MOE_CACHE_FORCE_DEVICE_LOCAL", 0, 1, force_device_local) &&
+            force_device_local != 0) {
+        if (dev.host_mapped) {
+            dev.host_mapped = false;
+            MOE_CACHE_LOG("[moe-cache] Vulkan: revalidate FORCE_DEVICE_LOCAL "
+                    "-> device-local (budget=%zu MiB)\n",
+                    budget_bytes >> 20);
+        }
+        return;
+    }
+    if (!dev.host_mapped) {
+        return;
+    }
+    if (dev.uma_heap_bytes >= budget_bytes) {
+        return;
+    }
+    // Effective budget exceeds the UMA/aperture heap chosen at session_create.
+    dev.host_mapped = false;
+    MOE_CACHE_LOG("[moe-cache] Vulkan: revalidate host-mapped -> device-local "
+            "(UMA heap=%zu MiB < budget=%zu MiB)\n",
+            dev.uma_heap_bytes >> 20, budget_bytes >> 20);
+}
+
 static moe_cache_pool * vk_moe_find_or_create_pool(
         moe_cache_vulkan_device & dev, moe_cache_session & session,
         size_t expert_size, int wtype, int64_t n_expert, size_t budget_bytes) {
@@ -753,6 +879,8 @@ static moe_cache_pool * vk_moe_find_or_create_pool(
                 expert_size >> 10);
         return nullptr;
     }
+
+    vk_moe_revalidate_host_mapped(dev, budget_bytes);
 
     size_t slots = budget_bytes / expert_size;
     if (slots < moe_cache_pool_slots_min) {
@@ -942,6 +1070,8 @@ static void * vk_moe_session_create(void * const * backends, int n_backends,
             ? (budget_mb << 20)
             : (size_t(1) << 30);
 
+        dev->uma_heap_bytes = uma_heap_bytes;
+
         if (force_dl) {
             dev->host_mapped = false;
             MOE_CACHE_LOG("[moe-cache] Vulkan: FORCE_DEVICE_LOCAL=1 "
@@ -950,8 +1080,9 @@ static void * vk_moe_session_create(void * const * backends, int n_backends,
         } else if (uma_heap_bytes >= uma_need_bytes) {
             dev->host_mapped = true;
             MOE_CACHE_LOG("[moe-cache] Vulkan: host-mapped UMA heap=%zu MiB "
-                    "(need=%zu MiB)\n",
-                    uma_heap_bytes >> 20, uma_need_bytes >> 20);
+                    "(need=%zu MiB)%s\n",
+                    uma_heap_bytes >> 20, uma_need_bytes >> 20,
+                    budget_mb == 0 ? " [provisional: budget_mb=0 used 1 GiB floor]" : "");
         } else if (uma_heap_bytes > 0) {
             dev->host_mapped = false;
             MOE_CACHE_LOG("[moe-cache] Vulkan: UMA heap=%zu MiB < need=%zu MiB; "
@@ -1000,6 +1131,15 @@ static void vk_moe_log_stats(moe_cache_vulkan_device & dev) {
             used, slots, dev.inserts, dev.fills, dev.fill_failures,
             dev.evictions, dev.insert_skips, dev.admission_skips,
             dev.dispatch_failures, dev.collect_failures, dev.contention_bypasses);
+    if (dev.staging_copies > 0 || dev.staging_bytes_h2d > 0) {
+        const double sync_ms = (double)dev.staging_sync_ns / 1.0e6;
+        const double mib = (double)dev.staging_bytes_h2d / (1024.0 * 1024.0);
+        MOE_CACHE_LOG("[moe-cache] Vulkan%d staging: copies=%lld bytes=%.1f MiB "
+                "sync=%.1f ms (avg %.2f ms/copy)\n",
+                dev.physical, dev.staging_copies, mib, sync_ms,
+                dev.staging_copies > 0
+                    ? sync_ms / (double)dev.staging_copies : 0.0);
+    }
 }
 
 static void vk_moe_session_destroy(void * opaque) {
@@ -1125,13 +1265,17 @@ static void * vk_moe_begin(const char * name, const void * host_base,
     }
     moe_cache_vulkan_device & dev =
         static_cast<moe_cache_vulkan_device &>(*session->devices[0]);
-    // A zero budget can never create a pool; skip GPU setup entirely.
-    if (session->config.budget_mb == 0) {
+    // Resolve free-minus-reserve (or explicit MiB cap) before GPU setup /
+    // pool create. Previously budget_mb==0 bailed here, so --moe-cache on/auto
+    // never activated on Vulkan.
+    if (!vk_moe_prepare_budget(*session, dev)) {
         return nullptr;
     }
+    const size_t budget_bytes = dev.budget_limit;
+    const size_t budget_mb_log = budget_bytes >> 20;
     // Create the command pool and compile the pipelines on first use, before
     // the dispatch lock so a one-time compile does not block other workers.
-    if (!vk_device_ensure_ready(dev, session->config.budget_mb)) {
+    if (!vk_device_ensure_ready(dev, budget_mb_log)) {
         return nullptr;
     }
 
@@ -1152,7 +1296,6 @@ static void * vk_moe_begin(const char * name, const void * host_base,
     }
 
     moe_cache_log_configuration(*session);
-    const size_t budget_bytes = session->config.budget_mb << 20;
     moe_cache_pool * pool = vk_moe_find_or_create_pool(
             dev, *session, expert_size, wtype, n_expert, budget_bytes);
     if (!pool) {
@@ -1223,6 +1366,22 @@ static int vk_moe_plan(void * opaque, const int32_t * ids, int n_ids,
     } else {
         n_fills = std::min((int)session.config.inserts_per_plan,
                            (int)(max_fill_bytes / node->expert_size));
+    }
+    // Staging thrash guard (T5-lite): after a warm-up of fills, if the pool is
+    // full and evictions track fills closely, further H->D reloads cost more
+    // than they save. Serve hits only for the rest of the session.
+    if (!dev.host_mapped && !dev.staging_thrash_stopped &&
+            pool.free_slots.empty() &&
+            dev.fills >= 256 &&
+            dev.evictions * 10 >= dev.fills * 8) {
+        dev.staging_thrash_stopped = true;
+        MOE_CACHE_LOG("[moe-cache] Vulkan%d: staging thrash guard - "
+                "evictions=%lld fills=%lld; stopping further staging fills "
+                "(hits-only for this session)\n",
+                dev.physical, dev.evictions, dev.fills);
+    }
+    if (dev.staging_thrash_stopped) {
+        n_fills = 0;
     }
     for (int index = 0; index < n_ids; index++) {
         const int32_t expert = ids[index];
@@ -1357,6 +1516,8 @@ static int vk_moe_plan(void * opaque, const int32_t * ids, int n_ids,
     // the pending slots. On failure roll them back so a later node cannot
     // consume the stale entries as hits.
     if (!pending.empty() && !dev.host_mapped && slab_buf) {
+        const size_t batch_bytes = pending.size() * node->expert_size;
+        const auto sync_t0 = std::chrono::steady_clock::now();
         const bool copy_ok = vk_submit_and_wait(dev, [&](VkCommandBuffer cmd) {
             std::vector<VkBufferCopy> regions;
             regions.reserve(pending.size());
@@ -1371,6 +1532,11 @@ static int vk_moe_plan(void * opaque, const int32_t * ids, int n_ids,
                             (uint32_t)regions.size(), regions.data());
             return true;
         });
+        const auto sync_t1 = std::chrono::steady_clock::now();
+        dev.staging_copies++;
+        dev.staging_bytes_h2d += (uint64_t)batch_bytes;
+        dev.staging_sync_ns += (uint64_t)std::chrono::duration_cast<
+                std::chrono::nanoseconds>(sync_t1 - sync_t0).count();
 
         if (copy_ok) {
             for (const pending_fill & fill : pending) {
@@ -1720,7 +1886,7 @@ static void vk_moe_end(void * opaque) {
 }
 
 // ---------------------------------------------------------------------------
-// Fused SwiGLU — not implemented for v1; stock CPU path handles the node.
+// Fused SwiGLU - not implemented for v1; stock CPU path handles the node.
 // ---------------------------------------------------------------------------
 
 static void * vk_moe_fused_begin(const ggml_moe_cache_tensor_desc * up,

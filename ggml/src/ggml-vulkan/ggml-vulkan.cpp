@@ -5611,6 +5611,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         (device->subgroup_size_control &&
          32u >= device->subgroup_min_size && 32u <= device->subgroup_max_size)
             ? 32u : 0u;
+    // TQ4_1S local_size_x is 32: with REQUIRE_FULL_SUBGROUPS and no pinned size, Vulkan
+    // requires local_size_x to be a multiple of maxSubgroupSize. On wave64-only devices
+    // that fails (32 is not a multiple of 64), so drop the full-subgroup requirement.
+    // turbo2/3/4 use local_size_x=128 and remain fine with require_full_subgroups=true.
+    const bool turbo_tq4_1s_full_subgroups =
+        turbo_set_rows_subgroup != 0 || device->subgroup_max_size <= 32;
 
 #define SET_ROWS(src_idx, src, itype) \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_F32],  "set_rows_" #src "_f32" #itype,  set_rows_ ## src ## _f32 ## itype ## _len,  set_rows_ ## src ## _f32 ## itype ## _data,  "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
@@ -5627,7 +5633,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TURBO2_0], "set_rows_" #src "_turbo2_0" #itype, set_rows_ ## src ## _turbo2_0 ## itype ## _len, set_rows_ ## src ## _turbo2_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true, true, turbo_set_rows_subgroup); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TURBO3_0], "set_rows_" #src "_turbo3_0" #itype, set_rows_ ## src ## _turbo3_0 ## itype ## _len, set_rows_ ## src ## _turbo3_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true, true, turbo_set_rows_subgroup); \
         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TURBO4_0], "set_rows_" #src "_turbo4_0" #itype, set_rows_ ## src ## _turbo4_0 ## itype ## _len, set_rows_ ## src ## _turbo4_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true, true, turbo_set_rows_subgroup); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TQ4_1S],   "set_rows_" #src "_tq4_1s" #itype,   set_rows_ ## src ## _tq4_1s ## itype ## _len,   set_rows_ ## src ## _tq4_1s ## itype ## _data,   "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true, true, turbo_set_rows_subgroup);
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_TQ4_1S],   "set_rows_" #src "_tq4_1s" #itype,   set_rows_ ## src ## _tq4_1s ## itype ## _len,   set_rows_ ## src ## _tq4_1s ## itype ## _data,   "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true, turbo_tq4_1s_full_subgroups, turbo_set_rows_subgroup);
 
     SET_ROWS(0, f32, _i32)
     SET_ROWS(0, f32, _i64)
